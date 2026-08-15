@@ -13,8 +13,8 @@ share every option below:
     enable = true;
     config.allowUnfree = true;
 
-    # Attributes pinned to an exact version, each resolved against whichever
-    # revision last shipped it.
+    # Attributes pinned to an exact version. The set is resolved together,
+    # onto as few revisions as the version lifetimes allow.
     pins = {
       vscode = "1.107.0";
       ripgrep = "13.0.0";
@@ -33,6 +33,22 @@ than installing one:
 ```nix
 programs.vscode.package = config.multiverse.pinned.vscode;
 # and, for a lock file, config.multiverse.locked.vscode
+```
+
+## How pins resolve
+
+The whole `pins` set is planned before anything is fetched: pins whose version
+lifetimes overlap share one revision instead of materialising one each, and a
+pin that cannot share resolves to the newest revision that shipped its
+version, exactly as a lone pin always has. Every pin still gets precisely the
+version it names. Sharing only decides which revision's build of that version
+serves it. See [many pins, few revisions](./nix-api.md#many-pins-few-revisions).
+
+To see the plan (which revisions your pins cost and which pin lands where),
+answered from the index without fetching anything:
+
+```nix
+config.multiverse.instance.pinPlan config.multiverse.pins
 ```
 
 An attribute claimed by more than one of `pins`, `lock` and
@@ -106,7 +122,9 @@ nixpkgs.overlays = [
 ```
 
 Now `pkgs.vscode` is 1.107.0 everywhere, and anything reading it — including
-other modules' `package` defaults — picks it up.
+other modules' `package` defaults — picks it up. The overlay resolves its
+pins the same shared way the module does: as few revisions as the version
+lifetimes allow.
 
 ## Without the module
 

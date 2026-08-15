@@ -5,6 +5,12 @@
 //! a single flake input moves everything at once, and that is why people end up
 //! not updating at all.
 //!
+//! Within that contract, pins being added or updated resolve *together*, onto
+//! as few revisions as their versions allow. It is the lock-side twin of the
+//! Nix API's `resolvePins`. Sharing never changes a resolved version, only
+//! which revision serves it, and untouched pins are read as candidates to
+//! share with, never rewritten.
+//!
 //! The two-step workflow this implies is honest rather than accidental. A pin
 //! can never point past what the index knows, because materialising a revision
 //! needs its narHash and `mvs` only has the ones in its baked database:
@@ -14,7 +20,7 @@
 //! $ mvs lock update helix           # move this one package
 //! ```
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
@@ -26,7 +32,7 @@ use crate::date;
 use crate::db::Index;
 use crate::output::{self, Cell, Table};
 use crate::query::Format;
-use crate::solve::{newest_pinnable, spans_for, Constraint};
+use crate::solve::{newest_pinnable, plan_serving, spans_for, Constraint, ServeTarget, Span};
 use crate::version;
 
 /// The lock file's name, and the one `multiverse.lib.readLock` expects.
@@ -108,6 +114,10 @@ pub fn lock_path(explicit: Option<&Path>) -> PathBuf {
 
 /// Resolve a constraint to the revision a pin should name: the newest indexed
 /// revision that satisfies it *and* can be materialised.
+///
+/// This is the reference `status` measures against. `add` and `update` resolve
+/// the same *version*, decided by the newest satisfying revision, but choose
+/// the serving revision through `plan_pins`, which may share one across pins.
 fn pin_for(index: &Index, constraint: &Constraint) -> Result<Pin> {
     let spans = spans_for(index, constraint)?;
     if spans.is_empty() {
@@ -132,29 +142,196 @@ fn pin_for(index: &Index, constraint: &Constraint) -> Result<Pin> {
     })
 }
 
-/// `mvs lock add <attr>[@ver]`
-pub fn add(index: &Index, path: &Path, spec: &str, format: Format) -> Result<()> {
-    let constraint = Constraint::parse(spec)?;
+/// A pin whose version is decided but whose serving revision is not yet: the
+/// version `pin_for` would give it, every span carrying that version, and the
+/// newest materialisable offset in each. Which revision *does* serve it is the
+/// plan's call.
+struct Target {
+    constraint: Constraint,
+    version: String,
+    spans: Vec<Span>,
+    candidates: Vec<i64>,
+}
+
+fn target_for(index: &Index, constraint: Constraint) -> Result<Target> {
+    let spans = spans_for(index, &constraint)?;
+    if spans.is_empty() {
+        return Err(anyhow!("no revision ever had {}", constraint.describe()));
+    }
+
+    let off = newest_pinnable(index, &spans)?;
+    let runs = index.runs_of(&constraint.attr)?;
+    let version = runs
+        .iter()
+        .find(|r| r.first <= off && off <= r.last)
+        .map(|r| r.version.clone())
+        .ok_or_else(|| {
+            anyhow!(
+                "{} is not in the index it just resolved from",
+                constraint.attr
+            )
+        })?;
+
+    let vspans: Vec<Span> = runs
+        .iter()
+        .filter(|r| r.version == version)
+        .map(|r| (r.first, r.last))
+        .collect();
+    let mut candidates = Vec::new();
+    for (first, last) in &vspans {
+        if let Some(c) = index.newest_materialisable_in(*first, *last)? {
+            candidates.push(c);
+        }
+    }
+    // `off` is materialisable and lies in one of these spans, so this cannot
+    // trigger unless the database changed under us mid-command.
+    if candidates.is_empty() {
+        return Err(anyhow!(
+            "no revision carrying {} {version} can be materialised",
+            constraint.attr
+        ));
+    }
+
+    Ok(Target {
+        constraint,
+        version,
+        spans: vspans,
+        candidates,
+    })
+}
+
+/// Serving revisions for several targets at once, sharing wherever the
+/// versions' lifetimes allow, including with `untouched`, the pins this
+/// command is not moving: their revisions are already paid for, so a target
+/// one of them satisfies lands there for free. Untouched pins are only ever
+/// read; the plan cannot move them.
+fn plan_pins(
+    index: &Index,
+    targets: Vec<Target>,
+    untouched: &BTreeMap<String, Pin>,
+) -> Result<BTreeMap<String, Pin>> {
+    let mut fixed = Vec::new();
+    for pin in untouched.values() {
+        // A revision the database does not know, such as a lock written
+        // against a newer index, cannot be shared with. That is not an error
+        // here; the pin itself is untouched either way.
+        if let Some(revision) = index.revision_by_prefix(&pin.rev)? {
+            fixed.push(revision.off);
+        }
+    }
+
+    let serve: Vec<ServeTarget> = targets
+        .iter()
+        .map(|t| ServeTarget {
+            key: t.constraint.attr.clone(),
+            spans: t.spans.clone(),
+            candidates: t.candidates.clone(),
+        })
+        .collect();
+    let plan = plan_serving(&serve, &fixed);
+
+    let mut pins = BTreeMap::new();
+    for target in targets {
+        let revision = index.revision(plan[&target.constraint.attr])?;
+        pins.insert(
+            target.constraint.attr.clone(),
+            Pin {
+                rev: revision.rev,
+                label: revision.label,
+                version: target.version,
+                date: revision.date,
+                constraint: target.constraint.version,
+            },
+        );
+    }
+    Ok(pins)
+}
+
+/// `lock: N pins on M revisions`, the consolidation at a glance, printed
+/// after anything that wrote the file. Skipped for a single pin, where it
+/// could only state the obvious.
+fn print_footprint(lock: &Lock) {
+    if lock.pins.len() < 2 {
+        return;
+    }
+    let revisions: BTreeSet<&str> = lock.pins.values().map(|p| p.rev.as_str()).collect();
+    anstream::println!(
+        "{}",
+        format!(
+            "lock: {} on {}",
+            output::plural(lock.pins.len(), "pin"),
+            output::plural(revisions.len(), "revision")
+        )
+        .style(output::muted())
+    );
+}
+
+/// `mvs lock add <attr>[@ver]...`
+///
+/// Every spec resolves to its own version exactly as a lone `add` would; the
+/// set then shares serving revisions wherever those versions overlap, with
+/// each other and with the pins already in the file.
+pub fn add(index: &Index, path: &Path, specs: &[String], format: Format) -> Result<()> {
+    let mut seen = BTreeSet::new();
+    let mut constraints = Vec::new();
+    for spec in specs {
+        let constraint = Constraint::parse(spec)?;
+        if !seen.insert(constraint.attr.clone()) {
+            return Err(anyhow!("{} is given more than once", constraint.attr));
+        }
+        constraints.push(constraint);
+    }
+
     let mut lock = Lock::read(path)?;
-    let pin = pin_for(index, &constraint)?;
-    let previous = lock.pins.insert(constraint.attr.clone(), pin.clone());
+
+    // A pin being re-added is being re-decided, so only the others hold still
+    // and offer their revisions.
+    let untouched: BTreeMap<String, Pin> = lock
+        .pins
+        .iter()
+        .filter(|(attr, _)| !seen.contains(*attr))
+        .map(|(attr, pin)| (attr.clone(), pin.clone()))
+        .collect();
+
+    let targets = constraints
+        .into_iter()
+        .map(|c| target_for(index, c))
+        .collect::<Result<Vec<_>>>()?;
+    let planned = plan_pins(index, targets, &untouched)?;
+
+    let mut added = Vec::new();
+    for (attr, pin) in planned {
+        let previous = lock.pins.insert(attr.clone(), pin.clone());
+        added.push((attr, pin, previous.is_some()));
+    }
     lock.write(path)?;
 
     if format == Format::Json {
-        return output::print_json(json!({ "attr": constraint.attr, "pin": pin }));
+        let pins: BTreeMap<&String, &Pin> =
+            added.iter().map(|(attr, pin, _)| (attr, pin)).collect();
+        return output::print_json(json!({ "pins": pins }));
     }
 
-    let verb = if previous.is_some() {
-        "repinned"
-    } else {
-        "pinned"
-    };
-    anstream::println!(
-        "{verb} {} {} at {}",
-        constraint.attr,
-        pin.version.style(output::current()),
-        pin.label
-    );
+    for (attr, pin, repinned) in &added {
+        let sharing: Vec<&str> = lock
+            .pins
+            .iter()
+            .filter(|(other, p)| *other != attr && p.rev == pin.rev)
+            .map(|(other, _)| other.as_str())
+            .collect();
+        let verb = if *repinned { "repinned" } else { "pinned" };
+        anstream::println!(
+            "{verb} {attr} {} at {}{}",
+            pin.version.style(output::current()),
+            pin.label,
+            if sharing.is_empty() {
+                String::new()
+            } else {
+                format!(" (with {})", sharing.join(", "))
+            }
+        );
+    }
+    print_footprint(&lock);
     Ok(())
 }
 
@@ -178,10 +355,15 @@ pub fn remove(path: &Path, attr: &str, format: Format) -> Result<()> {
     Ok(())
 }
 
-/// `mvs lock update [<attr>]` — move one pin, or every pin with `--all`.
+/// `mvs lock update [<attr>]`: move one pin, or every pin with `--all`.
 ///
-/// Each entry is recomputed on its own, so an update to one package cannot
-/// move another. That is the whole difference from a flake input.
+/// Only the named entries can move; that is the whole difference from a flake
+/// input. They are *replanned* together: each resolves to the newest version
+/// its constraint allows, exactly as before, and the serving revisions are
+/// shared among the targets and with the pins that are not moving. So
+/// `update <attr>` consolidates onto a revision the lock already pays for
+/// when one carries the right version, and `update --all` regroups the whole
+/// file onto as few revisions as the versions allow.
 pub fn update(
     index: &Index,
     path: &Path,
@@ -194,7 +376,7 @@ pub fn update(
         return Err(anyhow!("{} has no pins", path.display()));
     }
 
-    let targets: Vec<String> = match (attr, all) {
+    let target_names: Vec<String> = match (attr, all) {
         (Some(attr), _) => {
             if !lock.pins.contains_key(attr) {
                 return Err(anyhow!("{attr} is not pinned in {}", path.display()));
@@ -209,14 +391,30 @@ pub fn update(
         }
     };
 
+    let untouched: BTreeMap<String, Pin> = lock
+        .pins
+        .iter()
+        .filter(|(attr, _)| !target_names.contains(attr))
+        .map(|(attr, pin)| (attr.clone(), pin.clone()))
+        .collect();
+
+    let targets = target_names
+        .iter()
+        .map(|attr| {
+            target_for(
+                index,
+                Constraint {
+                    attr: attr.clone(),
+                    version: lock.pins[attr].constraint.clone(),
+                },
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let planned = plan_pins(index, targets, &untouched)?;
+
     let mut moved = Vec::new();
-    for attr in targets {
+    for (attr, new) in planned {
         let old = lock.pins[&attr].clone();
-        let constraint = Constraint {
-            attr: attr.clone(),
-            version: old.constraint.clone(),
-        };
-        let new = pin_for(index, &constraint)?;
         if new.rev != old.rev {
             moved.push(json!({
                 "attr": attr,
@@ -236,21 +434,33 @@ pub fn update(
     }
 
     if moved.is_empty() {
-        anstream::println!("every pin is already at the newest indexed revision");
+        anstream::println!("every pin is already where the plan puts it");
         return Ok(());
     }
     for entry in &moved {
-        anstream::println!(
-            "{}: {} → {}  ({})",
-            entry["attr"].as_str().unwrap(),
-            entry["from"]["version"].as_str().unwrap(),
-            entry["to"]["version"]
-                .as_str()
-                .unwrap()
-                .style(output::current()),
-            entry["to"]["label"].as_str().unwrap()
-        );
+        let from_version = entry["from"]["version"].as_str().unwrap();
+        let to_version = entry["to"]["version"].as_str().unwrap();
+        if from_version == to_version {
+            // The version held and only the serving revision moved, so say
+            // where it went from and to, or the line would read as a no-op.
+            anstream::println!(
+                "{}: {} · {} → {}",
+                entry["attr"].as_str().unwrap(),
+                to_version.style(output::current()),
+                entry["from"]["label"].as_str().unwrap(),
+                entry["to"]["label"].as_str().unwrap()
+            );
+        } else {
+            anstream::println!(
+                "{}: {} → {}  ({})",
+                entry["attr"].as_str().unwrap(),
+                from_version,
+                to_version.style(output::current()),
+                entry["to"]["label"].as_str().unwrap()
+            );
+        }
     }
+    print_footprint(&lock);
     Ok(())
 }
 

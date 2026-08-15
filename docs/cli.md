@@ -99,14 +99,31 @@ A version is a prefix, matched component by component: `python3@3.8` accepts
 ## Per-package pins
 
 ```
-mvs lock add <attr>[@ver]        mvs lock update [<attr> | --all]
+mvs lock add <attr>[@ver]...     mvs lock update [<attr> | --all]
 mvs lock rm <attr>               mvs lock status
 mvs lock list
 ```
 
-`mvs lock update helix` finds the newest indexed revision providing helix and
-rewrites **only** that entry. Every other pin stays exactly where it was, which
-is the difference from a single flake input that moves everything at once.
+`mvs lock update helix` finds the newest version helix may take and rewrites
+**only** that entry. Every other pin stays exactly where it was, which is the
+difference from a single flake input that moves everything at once.
+
+Within that contract, pins being added or updated are planned *together*, onto
+as few revisions as their versions allow. It is the lock-side twin of
+[`resolvePins`](./nix-api.md#many-pins-few-revisions). Every spec still
+resolves to the version it would get alone; sharing only decides which
+revision serves it, preferring revisions the lock already names:
+
+```console
+$ mvs lock add ripgrep@13.0.0 jq@1.6
+pinned jq 1.6 at 2023-09-25-6500b4580c2a (with ripgrep)
+pinned ripgrep 13.0.0 at 2023-09-25-6500b4580c2a (with jq)
+lock: 2 pins on 1 revision
+```
+
+`readLock` materialises one tree per distinct revision, so that last line is
+the fetch bill. `mvs lock update --all` replans the whole file the same way
+and pulls a lock built one pin at a time back together.
 
 ```json
 {

@@ -170,16 +170,25 @@ enum Command {
 
 #[derive(Subcommand)]
 enum Lock {
-    /// Pin a package to the newest indexed revision providing it
+    /// Pin packages, sharing revisions where their versions allow
+    ///
+    /// Each spec resolves to its own version as if pinned alone; the set then
+    /// shares serving revisions with each other and with pins already in the
+    /// lock, so several pins cost as few revisions as possible.
     Add {
-        #[arg(value_name = "ATTR[@VERSION]")]
-        spec: String,
+        #[arg(required = true, value_name = "ATTR[@VERSION]")]
+        specs: Vec<String>,
     },
 
     /// Remove a pin
     Rm { attr: String },
 
-    /// Move one pin — or every pin — to the newest indexed revision
+    /// Move one pin, or every pin, to the newest version it may take
+    ///
+    /// Only the named entries move. They are replanned together with the rest
+    /// of the lock, so an update lands on a revision the lock already pays
+    /// for whenever one carries the right version; `--all` regroups the whole
+    /// file onto as few revisions as the versions allow.
     Update {
         attr: Option<String>,
 
@@ -308,7 +317,7 @@ fn run() -> Result<()> {
         Command::Lock(l) => {
             let path = lock::lock_path(cli.file.as_deref());
             match l {
-                Lock::Add { spec } => lock::add(&index, &path, spec, format),
+                Lock::Add { specs } => lock::add(&index, &path, specs, format),
                 Lock::Rm { attr } => lock::remove(&path, attr, format),
                 Lock::Update { attr, all } => {
                     lock::update(&index, &path, attr.as_deref(), *all, format)

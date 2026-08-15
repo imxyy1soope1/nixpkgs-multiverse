@@ -30,6 +30,13 @@ let
   # forever, unlike anything resolved off a channel tip.
   pinnedVersion = "13.0.0";
 
+  # A second pin whose lifetime overlaps ripgrep 13.0.0's, so the two are
+  # planned onto ONE shared revision: the property the module inherits from
+  # resolvePins, and the reason materialising both pins below still fetches a
+  # single tree. This version is settled too; jq stayed at 1.6 for years and
+  # left the index long ago.
+  sharedPin = "1.6";
+
   # Declares the two options the wrappers write to, so each can be evaluated
   # without the module set that would normally provide them.
   stub =
@@ -63,7 +70,10 @@ let
   # list and the wrappers only place it.
   settings = {
     enable = true;
-    pins.ripgrep = pinnedVersion;
+    pins = {
+      ripgrep = pinnedVersion;
+      jq = sharedPin;
+    };
     cooldown = {
       enable = true;
       days = 30;
@@ -93,15 +103,18 @@ let
     };
   };
 
-  # A lock file as `mvs lock` writes one, pinning the same ripgrep by commit
-  # rather than by version. Built here rather than committed so it never has to
-  # be rewritten as the index grows; tests/lock.nix covers readLock itself.
+  # A lock file as `mvs lock` writes one, pinning jq by commit rather than by
+  # version, deliberately at the revision jq 1.6 resolves to. That is also the
+  # one the pin plan above chooses, so the lock assertions reuse the tree the
+  # pin assertions already materialised instead of fetching a second one.
+  # Built here rather than committed so it never has to be rewritten as the
+  # index grows; tests/lock.nix covers readLock itself.
   lockFile = builtins.toFile "multiverse.lock" (
     builtins.toJSON {
       version = 1;
-      pins.ripgrep = {
-        rev = builtins.substring 11 12 (mv.revOf "ripgrep" pinnedVersion);
-        version = pinnedVersion;
+      pins.jq = {
+        rev = builtins.substring 11 12 (mv.revOf "jq" sharedPin);
+        version = sharedPin;
       };
     }
   );
@@ -115,7 +128,7 @@ let
   # collides exactly the way `pins` and `cooldown.packages` do.
   contestedLock = eval ../modules/nixos.nix {
     enable = true;
-    pins.ripgrep = pinnedVersion;
+    pins.jq = sharedPin;
     lock = lockFile;
   };
 
@@ -123,7 +136,7 @@ let
 in
 
 # Each wrapper writes the core's list to its own option, and to nothing else.
-assert builtins.length nixos.multiverse.packages == 2;
+assert builtins.length nixos.multiverse.packages == 3;
 assert nixos.environment.systemPackages == nixos.multiverse.packages;
 assert nixos.home.packages == [ ];
 assert darwin.environment.systemPackages == darwin.multiverse.packages;
@@ -131,10 +144,19 @@ assert darwin.home.packages == [ ];
 assert home.home.packages == home.multiverse.packages;
 assert home.environment.systemPackages == [ ];
 
-# Pins resolve to real derivations, keyed by attribute. This is the one
-# assertion that materialises a revision.
-assert builtins.attrNames nixos.multiverse.pinned == [ "ripgrep" ];
+# The two pins overlap in time, so the plan puts them on one revision. That is
+# what keeps the assertions after this one to a single materialisation.
+assert builtins.length (nixos.multiverse.instance.pinPlan settings.pins) == 1;
+
+# Pins resolve to real derivations, keyed by attribute. These are the
+# assertions that materialise a revision, shared by both pins.
+assert
+  builtins.attrNames nixos.multiverse.pinned == [
+    "jq"
+    "ripgrep"
+  ];
 assert nixos.multiverse.pinned.ripgrep.version == pinnedVersion;
+assert nixos.multiverse.pinned.jq.version == sharedPin;
 
 # Cooldown resolves the attributes it was given, and gates on its own `enable`
 # rather than on the module's — a half-configured cooldown installs nothing and
@@ -151,8 +173,8 @@ assert failing nixos == [ ];
 
 # A lock file installs its pins the same way `pins` does, and lands in the same
 # package list.
-assert builtins.attrNames locked.multiverse.locked == [ "ripgrep" ];
-assert locked.multiverse.locked.ripgrep.version == pinnedVersion;
+assert builtins.attrNames locked.multiverse.locked == [ "jq" ];
+assert locked.multiverse.locked.jq.version == sharedPin;
 assert locked.environment.systemPackages == builtins.attrValues locked.multiverse.locked;
 
 # A lock file is not set by default, and setting none resolves to no packages
@@ -172,4 +194,6 @@ assert nixos.multiverse.instance ? versionsOf;
   pinned = builtins.attrNames nixos.multiverse.pinned;
   cooled = builtins.attrNames nixos.multiverse.cooldown.resolved;
   ripgrep = nixos.multiverse.pinned.ripgrep.version;
+  jq = nixos.multiverse.pinned.jq.version;
+  pinRevisions = builtins.length (nixos.multiverse.instance.pinPlan settings.pins);
 }

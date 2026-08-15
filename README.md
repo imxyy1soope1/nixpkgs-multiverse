@@ -91,6 +91,9 @@ Pin a package from a NixOS, nix-darwin, or home-manager configuration:
 }
 ```
 
+Several pins are resolved together, onto as few revisions as their version
+lifetimes allow. See [how pins resolve](./docs/modules.md#how-pins-resolve).
+
 Enumerating versions fetches nothing — it reads an index file. A revision is
 materialised the first time you force a derivation.
 

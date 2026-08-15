@@ -186,6 +186,104 @@ fn locks_pins() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// The newest revision at which ripgrep 13.0.0, fd 8.7.0 and jq 1.6 were all
+/// current, jq 1.6's last sighting. Fixed forever: every one of those
+/// versions is long closed, so the overlap can never move.
+const SHARED_REV: &str = "6500b4580c2a1f3d0f980d32d285739d8e156d92";
+const SHARED_LABEL: &str = "2023-09-25-6500b4580c2a";
+
+/// Pins that can share a revision do: several specs in one add, a later add
+/// joining the lock's existing revision, an update consolidating onto it, and
+/// a plan that is stable under its own output.
+#[test]
+fn locks_share_revisions() {
+    let Some(mvs) = mvs() else { return };
+
+    let dir = std::env::temp_dir().join(format!("mvs-cli-lock-share-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("multiverse.lock");
+    let file = file.to_str().unwrap();
+
+    // Added together, ripgrep 13.0.0 and jq 1.6 land on one revision, the
+    // newest where both lifetimes still overlap, with each still resolving
+    // to exactly the version it asked for.
+    mvs.stdout(&[
+        "lock",
+        "--file",
+        file,
+        "add",
+        &format!("ripgrep@{OLD_RIPGREP}"),
+        "jq@1.6",
+    ]);
+    let lock: serde_json::Value =
+        serde_json::from_str(&mvs.stdout(&["--json", "lock", "--file", file, "list"])).unwrap();
+    assert_eq!(lock["pins"]["ripgrep"]["version"], OLD_RIPGREP);
+    assert_eq!(lock["pins"]["jq"]["version"], "1.6");
+    assert_eq!(lock["pins"]["ripgrep"]["rev"], SHARED_REV);
+    assert_eq!(lock["pins"]["jq"]["rev"], SHARED_REV);
+
+    // A pin added later joins a revision the lock already pays for, not the
+    // newest revision carrying its version.
+    mvs.stdout(&["lock", "--file", file, "add", "fd@8.7.0"]);
+    let lock: serde_json::Value =
+        serde_json::from_str(&mvs.stdout(&["--json", "lock", "--file", file, "list"])).unwrap();
+    assert_eq!(lock["pins"]["fd"]["version"], "8.7.0");
+    assert_eq!(lock["pins"]["fd"]["rev"], SHARED_REV);
+
+    // The plan is stable under its own output: nothing left to move.
+    let moved: serde_json::Value =
+        serde_json::from_str(&mvs.stdout(&["--json", "lock", "--file", file, "update", "--all"]))
+            .unwrap();
+    assert_eq!(moved["moved"].as_array().unwrap().len(), 0);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A lock built one pin at a time scatters, since each add can only share
+/// with what is already there, and `update` pulls it back together: the named
+/// pin moves onto a revision the untouched pins already pay for, same version.
+#[test]
+fn update_consolidates_revisions() {
+    let Some(mvs) = mvs() else { return };
+
+    let dir = std::env::temp_dir().join(format!("mvs-cli-lock-consolidate-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("multiverse.lock");
+    let file = file.to_str().unwrap();
+
+    // Alone, ripgrep pins to 13.0.0's newest sighting; jq 1.6 ended earlier,
+    // so its add cannot share and the lock holds two revisions.
+    mvs.stdout(&[
+        "lock",
+        "--file",
+        file,
+        "add",
+        &format!("ripgrep@{OLD_RIPGREP}"),
+    ]);
+    mvs.stdout(&["lock", "--file", file, "add", "jq@1.6"]);
+    let lock: serde_json::Value =
+        serde_json::from_str(&mvs.stdout(&["--json", "lock", "--file", file, "list"])).unwrap();
+    assert_eq!(lock["pins"]["ripgrep"]["rev"], OLD_RIPGREP_REV);
+    assert_eq!(lock["pins"]["jq"]["rev"], SHARED_REV);
+
+    // Updating ripgrep keeps its version, since 13.0.0 is the newest 13.0.0
+    // there is, and moves it onto jq's revision, which carries it too.
+    let moved: serde_json::Value =
+        serde_json::from_str(&mvs.stdout(&["--json", "lock", "--file", file, "update", "ripgrep"]))
+            .unwrap();
+    let moved = moved["moved"].as_array().unwrap();
+    assert_eq!(moved.len(), 1);
+    assert_eq!(moved[0]["attr"], "ripgrep");
+    assert_eq!(moved[0]["from"]["version"], OLD_RIPGREP);
+    assert_eq!(moved[0]["to"]["version"], OLD_RIPGREP);
+    assert_eq!(moved[0]["to"]["label"], SHARED_LABEL);
+
+    let lock: serde_json::Value =
+        serde_json::from_str(&mvs.stdout(&["--json", "lock", "--file", file, "list"])).unwrap();
+    assert_eq!(lock["pins"]["ripgrep"]["rev"], SHARED_REV);
+    assert_eq!(lock["pins"]["jq"]["rev"], SHARED_REV);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// `--eval` takes the evaluation road: `mvs run` resolves to the commit that
 /// shipped the version and hands the rest to nix. Checked through --dry-run,
 /// so the test does not fetch 378 MB.

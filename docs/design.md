@@ -174,6 +174,43 @@ nobody looked at.
 `releases.json` is separate and indexed by nothing: 25 release channels, each
 holding the current tip of its branch. Releases move as backports are applied, so a release is a channel, not a snapshot, and it lives outside the revision array for that reason. See [releases move, revisions do not](./nix-api.md#releases-move-revisions-do-not).
 
+## Grouped pins
+
+`version` resolves one (attribute, version) pair to the newest revision that
+shipped it. Hand a *set* of pins to that rule one at a time and the worst
+case is one revision per pin. Five pins mean five individual nixpkgs fetches
+and scans, even when a single revision carried every requested version at once.
+
+The history index records every revision each version was present in, so
+resolving a set is a covering problem: pick points on the revision axis such
+that every pin's runs contain at least one, and as few points as possible. In
+full generality that is set cover, so `resolvePins` plans with the standard
+greedy, repeatedly taking the revision that satisfies the most unresolved
+pins, with two deliberate preferences layered on:
+
+- **Fewer revisions beat freshness.** A revision costs a fetch and an
+  evaluation; a version served from earlier in its own lifetime is the same
+  version. Freshness only breaks ties.
+- **Ties go to the newest revision**, for the same reason the index keeps
+  newest-only: the most patched build, the most likely to still substitute.
+
+Only run *ends* are ever candidates. A minimum piercing never needs an
+interior point; any pierce point slides right to the nearest end of a run
+containing it without leaving any run it was in. Run ends are observed
+sightings, where an interior offset can be one the extractor skipped and the
+run merely bridges.
+
+Two consequences follow. A pin that cannot share resolves to exactly what
+`version` picks, so nothing regresses by being planned. A pin that does share
+may be served by an older build of its version than `version` would choose:
+same version, same upstream source, older surrounding dependencies. That is
+inherent to sharing a revision at all.
+
+Planning reads `history.json`, which `version` deliberately never pays for
+(see [the index](#the-index)): ~40-50 ms of `fromJSON`, against whole
+revisions not fetched. A single pin skips the planner entirely and keeps
+`version`'s exact cost and behaviour.
+
 ---
 
 For the longer version of this story, see the blog post:

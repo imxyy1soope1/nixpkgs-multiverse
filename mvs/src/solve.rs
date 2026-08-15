@@ -7,6 +7,13 @@
 //!
 //! Proving *un*satisfiability and saying why is the part no other tool does.
 //! mise and asdf cannot, because they do not model compatibility at all.
+//!
+//! `plan_serving` below asks the sibling question for `mvs lock`: not one
+//! revision for everything, but as *few* revisions as a set of already-resolved
+//! versions allows. Each pin keeps its version, and pins whose lifetimes
+//! overlap share a revision instead of naming one each.
+
+use std::collections::BTreeMap;
 
 use anyhow::{anyhow, Result};
 use owo_colors::OwoColorize;
@@ -153,6 +160,76 @@ pub fn newest_pinnable(index: &Index, spans: &[Span]) -> Result<i64> {
 
 fn count(spans: &[Span]) -> i64 {
     spans.iter().map(|(first, last)| last - first + 1).sum()
+}
+
+/// Whether an offset falls inside any of these spans.
+pub fn within(spans: &[Span], off: i64) -> bool {
+    spans
+        .iter()
+        .any(|(first, last)| *first <= off && off <= *last)
+}
+
+/// One pin awaiting a serving revision: its version is already decided, and
+/// these are the places that version was seen.
+pub struct ServeTarget {
+    /// The attribute, which is what the plan keys its answer by.
+    pub key: String,
+    /// Every span carrying the resolved version.
+    pub spans: Vec<Span>,
+    /// The newest materialisable offset in each span, the only offsets a plan
+    /// ever picks. Never empty: the offset that decided the version is one.
+    pub candidates: Vec<i64>,
+}
+
+/// Choose a serving revision for every target, using as few distinct
+/// revisions as the spans allow.
+///
+/// `fixed` are revisions already paid for, meaning the pins the caller is not
+/// touching. Any target one of them can serve takes the newest such and costs
+/// nothing. The rest is greedy set cover, the same plan `resolvePins` makes
+/// on the Nix side: repeatedly take the offset serving the most remaining
+/// targets, newest offset among equals. Only targets move; nothing here ever
+/// proposes moving a fixed revision.
+pub fn plan_serving(targets: &[ServeTarget], fixed: &[i64]) -> BTreeMap<String, i64> {
+    let mut assigned = BTreeMap::new();
+
+    let mut remaining: Vec<&ServeTarget> = targets
+        .iter()
+        .filter(
+            |t| match fixed.iter().filter(|&&off| within(&t.spans, off)).max() {
+                Some(&off) => {
+                    assigned.insert(t.key.clone(), off);
+                    false
+                }
+                None => true,
+            },
+        )
+        .collect();
+
+    while !remaining.is_empty() {
+        // The best offset always serves at least the target it is a candidate
+        // of, because candidates lie inside their own spans, so every round
+        // shrinks `remaining` and the loop terminates.
+        let best = remaining
+            .iter()
+            .flat_map(|t| t.candidates.iter().copied())
+            .max_by_key(|&off| {
+                (
+                    remaining.iter().filter(|t| within(&t.spans, off)).count(),
+                    off,
+                )
+            })
+            .expect("every target carries at least one candidate");
+        remaining.retain(|t| {
+            if within(&t.spans, best) {
+                assigned.insert(t.key.clone(), best);
+                false
+            } else {
+                true
+            }
+        });
+    }
+    assigned
 }
 
 pub fn solve(index: &Index, specs: &[String], format: Format) -> Result<()> {
@@ -403,5 +480,75 @@ mod tests {
             [(5, 10), (20, 30)]
         );
         assert_eq!(intersect(&[], &[(5, 10)]), []);
+    }
+
+    fn target(key: &str, spans: &[Span], candidates: &[i64]) -> ServeTarget {
+        ServeTarget {
+            key: key.to_string(),
+            spans: spans.to_vec(),
+            candidates: candidates.to_vec(),
+        }
+    }
+
+    /// Overlapping targets share one revision; disjoint ones get one each,
+    /// resolved newest-first so the lone newest pin lands exactly where the
+    /// old per-pin rule put it.
+    #[test]
+    fn plans_shared_revisions() {
+        let plan = plan_serving(
+            &[target("a", &[(0, 10)], &[10]), target("b", &[(5, 8)], &[8])],
+            &[],
+        );
+        assert_eq!(plan["a"], 8);
+        assert_eq!(plan["b"], 8);
+
+        let plan = plan_serving(
+            &[target("a", &[(0, 4)], &[4]), target("b", &[(6, 9)], &[9])],
+            &[],
+        );
+        assert_eq!(plan["a"], 4);
+        assert_eq!(plan["b"], 9);
+    }
+
+    /// Coverage beats freshness, freshness breaks ties: the point serving both
+    /// targets wins over the newer point serving one.
+    #[test]
+    fn prefers_coverage_then_newest() {
+        let plan = plan_serving(
+            &[
+                target("a", &[(0, 10)], &[10]),
+                target("b", &[(0, 12)], &[12]),
+            ],
+            &[],
+        );
+        assert_eq!(plan["a"], 10);
+        assert_eq!(plan["b"], 10);
+    }
+
+    /// A pierce point can sit at another target's span end: gaps in one
+    /// target's lifetime do not stop it sharing where the runs overlap.
+    #[test]
+    fn plans_across_gaps() {
+        let plan = plan_serving(
+            &[
+                target("a", &[(0, 2), (8, 9)], &[2, 9]),
+                target("b", &[(0, 3)], &[3]),
+            ],
+            &[],
+        );
+        assert_eq!(plan["a"], 2);
+        assert_eq!(plan["b"], 2);
+    }
+
+    /// Fixed revisions are free: a target one can serve takes the newest such
+    /// fixed revision instead of anything from the cover, and a fixed
+    /// revision outside every span changes nothing.
+    #[test]
+    fn reuses_fixed_revisions() {
+        let plan = plan_serving(&[target("a", &[(0, 10)], &[10])], &[3, 7]);
+        assert_eq!(plan["a"], 7);
+
+        let plan = plan_serving(&[target("a", &[(0, 10)], &[10])], &[20]);
+        assert_eq!(plan["a"], 10);
     }
 }

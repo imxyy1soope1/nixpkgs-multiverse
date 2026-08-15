@@ -290,6 +290,10 @@ nix-repl> (mv.at "13.10").hello.name
 mv.versionsOf "python3"
 # every known revision that shipped a version
 mv.revOf "python3" "3.8.9"
+# a pin set planned onto as few revisions as possible, as {attr -> derivation}
+mv.resolvePins { ripgrep = "13.0.0"; jq = "1.6"; }
+# the plan itself: which revisions those pins cost, fetching nothing
+mv.pinPlan { ripgrep = "13.0.0"; jq = "1.6"; }
 # unstable as it stood N days before any anchor
 mv.daysBehind "tip" 7
 # a revision as the flake attrset `inputs.nixpkgs` would have been
@@ -348,7 +352,45 @@ A version may have been upgraded and then downgraded, or removed and later re-ad
 - `earliest` / `latest` are the **outer bounds of every sighting**.
 - `runs` are the **unbroken stretches**.
 
-## As an input to your own flake
+## Many pins, few revisions
+
+`version` resolves each pair on its own, to the newest revision that shipped
+it. That is the right default for one package and the worst case for a set:
+five pins can materialise five revisions, each a full nixpkgs fetch and
+evaluation, even when one revision carried all five versions at once.
+
+`resolvePins` takes the whole set and plans it first, against the version
+history above. Every pin still gets exactly the version it names, grouped
+onto as few revisions as the recorded lifetimes allow:
+
+```nix
+mv.resolvePins { ripgrep = "13.0.0"; fd = "8.7.0"; jq = "1.6"; }
+# => { ripgrep = <drv>; fd = <drv>; jq = <drv>; }   # one nixpkgs revision
+```
+
+`pinPlan` is the same decision as data, and fetches nothing: which revisions
+a pin set costs, and which pin lands where. The labels feed straight back
+into `at`:
+
+```console
+nix-repl> mv.pinPlan { ripgrep = "13.0.0"; fd = "8.7.0"; jq = "1.6"; }
+[ { rev = "6500b4580c2a…"; date = "2023-09-25";
+    label = "2023-09-25-6500b4580c2a";
+    pins = { fd = "8.7.0"; jq = "1.6"; ripgrep = "13.0.0"; }; } ]
+```
+
+What moves is *which build* of a version serves a pin: a shared revision can
+sit earlier in a version's lifetime than the newest sighting `version` picks,
+with the same version and upstream source but possibly older surrounding
+dependencies.
+A pin that cannot share keeps resolving exactly as `version` does, and among
+equally small plans the newest revisions win, the same way the index leans
+everywhere else.
+
+The [NixOS and home-manager modules](./modules.md) resolve `multiverse.pins`
+through this, as does `lib.pinOverlay`.
+
+As an input to your own flake
 
 ```nix
 {
@@ -360,10 +402,12 @@ A version may have been upgraded and then downgraded, or removed and later re-ad
     in
     {
       devShells.x86_64-linux.default = nixpkgs.legacyPackages.x86_64-linux.mkShell {
-        packages = [
-          (mv.version "python3" "3.8.9")
-          (mv.version "nodejs" "14.17.0")
-        ];
+        # These two were current at the same time, so resolvePins serves both
+        # from one revision; mv.version would have evaled one nixpkgs instance one each.
+        packages = builtins.attrValues (mv.resolvePins {
+          python3 = "3.8.9";
+          nodejs = "14.17.0";
+        });
       };
     };
 }

@@ -617,6 +617,9 @@
         # The system comes off `final` rather than being an argument: reading it
         # from the package set being extended is what keeps this usable inside
         # `nixpkgs.overlays` without a second source of truth for the platform.
+        #
+        # Pins resolve through `resolvePins`, so the set costs as few revisions
+        # as the index can prove sufficient rather than one per pin.
         pinOverlay =
           {
             pins,
@@ -630,7 +633,7 @@
               inherit config overlays;
             };
           in
-          builtins.mapAttrs (attr: version: mv.version attr version) pins;
+          mv.resolvePins pins;
       };
 
       # One shared core, three entry points over two placements. A wrapper adds
@@ -708,6 +711,7 @@
           installables = evalTest "test-installables" ./tests/installables.nix;
           module = evalTest "test-module" ./tests/module.nix;
           history = evalTest "test-history" ./tests/history.nix;
+          pins = evalTest "test-pins" ./tests/pins.nix;
           lock = evalTest "test-lock" ./tests/lock.nix;
           fast = evalTest "test-fast" ./tests/fast.nix;
           compose = (import ./tests/compose.nix { inherit system; }).env;

@@ -96,8 +96,14 @@ in
         }
       '';
       description = ''
-        Top-level nixpkgs attributes pinned to an exact version, each resolved
-        against whichever revision last shipped that version.
+        Top-level nixpkgs attributes pinned to an exact version.
+
+        The set is resolved together, onto as few revisions as the index can
+        prove sufficient: pins whose version lifetimes overlap share one
+        revision instead of instantiating one each. A pin that cannot share
+        resolves to the newest revision that shipped its version. Every pin
+        still gets precisely the version named here; sharing only decides
+        which revision's build of that version serves it.
 
         A pin is a derivation from a *different* nixpkgs revision, so it brings
         that revision's closure rather than the running system's — including its
@@ -221,11 +227,16 @@ in
     pinned = lib.mkOption {
       type = lib.types.raw;
       readOnly = true;
-      default = builtins.mapAttrs (attr: version: mv.version attr version) cfg.pins;
-      defaultText = lib.literalExpression "{ <name> = <derivation>; }";
+      default = mv.resolvePins cfg.pins;
+      defaultText = lib.literalExpression "multiverse.resolvePins pins";
       description = ''
         `pins` resolved to derivations, keyed by attribute, so a pin can also be
         handed to an option that takes a package rather than only installed.
+
+        The whole set is planned onto as few revisions as possible before
+        anything is fetched. To see the plan itself (which revisions the pins
+        cost and which pin lands where, answered from the index alone), ask
+        `config.multiverse.instance.pinPlan config.multiverse.pins`.
       '';
     };
 

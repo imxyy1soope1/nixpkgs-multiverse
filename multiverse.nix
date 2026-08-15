@@ -534,6 +534,21 @@ let
   # nothing-is-eager doctrine as the revisions themselves.
   # ---------------------------------------------------------------------------
 
+  # The unknown-pair error, shared between `version` and the pin planner: both
+  # are where a typo'd version first surfaces, and the report should read the
+  # same from either.
+  noVersion =
+    attr: ver:
+    let
+      known = sortVersions (builtins.attrNames (versionsFor attr));
+    in
+    throw ''
+      multiverse: no revision provides ${attr} ${ver}.
+      Known versions: ${
+        if known == [ ] then "(attribute not in index)" else builtins.concatStringsSep " " known
+      }
+    '';
+
   # The real-derivation resolver, hoisted out of the exported set because the
   # fast path below hands it out as `.eval` on every fake. `version` in the
   # exported set is this exact function.
@@ -541,17 +556,123 @@ let
     attr: ver:
     let
       i = (versionsFor attr).${ver} or null;
-      known = sortVersions (builtins.attrNames (versionsFor attr));
     in
-    if i == null then
-      throw ''
-        multiverse: no revision provides ${attr} ${ver}.
-        Known versions: ${
-          if known == [ ] then "(attribute not in index)" else builtins.concatStringsSep " " known
-        }
-      ''
+    if i == null then noVersion attr ver else instances.${toString i}.${attr};
+
+  # ---------------------------------------------------------------------------
+  # Grouped pin resolution: many exact-version pins, as few revisions as
+  # possible.
+  #
+  # `version` resolves each pair on its own, to the newest revision shipping
+  # it. That is the right default for one package and the worst case for a
+  # set: five pins can instantiate five revisions when one revision carried
+  # all five versions at once. The history index already knows *every*
+  # revision each version was present in, so resolving a set is a covering
+  # problem: choose pierce points on the revision axis such that every pin's
+  # runs contain at least one, and as few of them as possible.
+  #
+  # In full generality that is set cover, so the planner is the standard
+  # greedy: repeatedly take the offset satisfying the most unresolved pins.
+  # Ties go to the newest offset, for the same reason the index keeps newest:
+  # the most patched build, the most likely to still substitute. The order of
+  # preference is deliberate: fewer revisions first, freshness second. A
+  # revision costs a ~378 MB fetch and an evaluation; a version served from
+  # slightly earlier in its own lifetime is the same version.
+  #
+  # Planning reads index/history.json, which `version` deliberately never
+  # pays for (see build-history.sh). That is the trade: ~40-50 ms of
+  # fromJSON once per evaluation, against whole revisions not fetched.
+  # ---------------------------------------------------------------------------
+
+  # Every offset known to satisfy (attr, ver), as closed runs: the history's
+  # sightings, plus the newest-only offset the version index records as a
+  # degenerate run. The two normally agree: the version index's offset is the
+  # last end of the history's last run. But between rebuilds one file can
+  # cover a revision the other has not reached, and each records only observed
+  # sightings, so their union is exactly what is known.
+  satRuns =
+    attr: ver:
+    let
+      rs = runsOf attr ver;
+      vOff = (versionsFor attr).${ver} or null;
+    in
+    if rs == null && vOff == null then
+      noVersion attr ver
     else
-      instances.${toString i}.${attr};
+      (if rs == null then [ ] else rs)
+      ++ (
+        if vOff == null then
+          [ ]
+        else
+          [
+            [
+              vOff
+              vOff
+            ]
+          ]
+      );
+
+  satisfiedBy = runs: c: builtins.any (r: builtins.elemAt r 0 <= c && c <= builtins.elemAt r 1) runs;
+
+  # Candidate pierce points for one pin: the right end of each of its runs.
+  # Nothing else is ever needed. Any pierce point slides right to the nearest
+  # end of a run containing it without leaving any run it was in, and run
+  # ends are always *observed* sightings, where an interior offset can be one
+  # the extractor skipped and the run merely bridges.
+  #
+  # Filtered to materialisable revisions so a plan never lands on an offset
+  # that cannot be fetched. If nothing survives (a state only a half-built
+  # index can produce), keep the unfiltered ends and let pathFor name the
+  # problem when the pin is forced, exactly as `version` would.
+  pierceCandidates =
+    runs:
+    let
+      ends = map (r: builtins.elemAt r 1) runs;
+      ok = builtins.filter materialisable ends;
+    in
+    if ok == [ ] then ends else ok;
+
+  # The plan, as raw offsets: [ { off; attrs = [ name ... ]; } ], one entry
+  # per revision the pin set needs, in the order the greedy chose them: most
+  # pins first, newest first among equals. Terminates because every unresolved
+  # pin contributes a candidate that satisfies at least itself, so each round
+  # resolves one pin or more.
+  planPins =
+    pins:
+    let
+      sat = builtins.mapAttrs satRuns pins;
+      go =
+        unsat:
+        if unsat == [ ] then
+          [ ]
+        else
+          let
+            candidates = builtins.concatMap (attr: pierceCandidates sat.${attr}) unsat;
+            coverage = c: builtins.length (builtins.filter (attr: satisfiedBy sat.${attr} c) unsat);
+            best = builtins.foldl' (
+              acc: c:
+              let
+                n = coverage c;
+              in
+              if acc == null || n > acc.n || (n == acc.n && c > acc.off) then
+                {
+                  off = c;
+                  inherit n;
+                }
+              else
+                acc
+            ) null candidates;
+            hit = builtins.partition (attr: satisfiedBy sat.${attr} best.off) unsat;
+          in
+          [
+            {
+              off = best.off;
+              attrs = hit.right;
+            }
+          ]
+          ++ go hit.wrong;
+    in
+    go (builtins.attrNames pins);
 
   dataPins = builtins.fromJSON (builtins.readFile ./data-pins.json);
 
@@ -933,6 +1054,48 @@ rec {
   # coexist happily — Nix keeps them disjoint, so several versions of the same
   # package can sit in one buildEnv.
   version = versionDrv;
+
+  # Resolve a set of exact-version pins together, onto as few revisions as
+  # the index can prove sufficient:
+  #
+  #   resolvePins { ripgrep = "13.0.0"; fd = "8.7.0"; jq = "1.6"; }
+  #   => { ripgrep = <drv>; fd = <drv>; jq = <drv>; }    # one nixpkgs revision
+  resolvePins =
+    pins:
+    let
+      offByAttr = builtins.listToAttrs (
+        builtins.concatMap (
+          g:
+          map (attr: {
+            name = attr;
+            value = g.off;
+          }) g.attrs
+        ) (planPins pins)
+      );
+    in
+    if builtins.length (builtins.attrNames pins) < 2 then
+      builtins.mapAttrs versionDrv pins
+    else
+      builtins.mapAttrs (attr: _: instances.${toString offByAttr.${attr}}.${attr}) pins;
+
+  # Calculate the plan `resolvePins` executes, without fetching, as data: which
+  # revisions a pin set costs and which pin lands where.
+  #
+  #   pinPlan { ripgrep = "13.0.0"; fd = "8.7.0"; jq = "1.6"; }
+  #   => [ { rev = …; date = "2023-06-07"; label = "2023-06-07-…";
+  #          pins = { fd = "8.7.0"; jq = "1.6"; ripgrep = "13.0.0"; }; } ]
+  pinPlan =
+    pins:
+    map (g: {
+      inherit (revAt g.off) rev date;
+      label = labelOf g.off;
+      pins = builtins.listToAttrs (
+        map (attr: {
+          name = attr;
+          value = pins.${attr};
+        }) g.attrs
+      );
+    }) (planPins pins);
 
   # A lock file written by `mvs lock`, resolved to derivations:
   #
